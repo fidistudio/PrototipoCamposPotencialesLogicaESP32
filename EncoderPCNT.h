@@ -4,103 +4,104 @@
 #include <Arduino.h>
 #include "driver/pcnt.h"
 
-// Forward declaration de calibrador
+// Forward declaration
 class SectorCalibrator;
 
 // ==============================
 //  EncoderPCNT (KY-003 1 canal)
-//  - Cuenta pulsos con PCNT
-//  - Filtro HW antirruido (glitch)
-//  - Ventana lógica (min gap us)
-//  - Estima RPM y rad/s con EMA
-//  - Aplica LUT sectorial (si hay calibrador)
+//  - Cuenta pulsos con PCNT (ESP32)
+//  - Filtro HW antirruido (glitch) + ventana lógica (minGapUs)
+//  - Estima RPM y rad/s con EMA del periodo
+//  - Índice de sector con dirección (+1/-1) para casar LUT en ambos sentidos
+//  - Integra calibración/alineación por sectores via SectorCalibrator
+// ==============================
 class EncoderPCNT {
 public:
   struct Config {
     gpio_num_t     pin;              // GPIO del KY-003 (open collector + pull-up)
     pcnt_unit_t    unit;             // PCNT_UNIT_0..PCNT_UNIT_7
     pcnt_channel_t channel;          // PCNT_CHANNEL_0 o _1
-    int            pulsesPerRev;     // PPR efectivos
-    bool           countRising   = false;   // true: rising, false: falling (KY-003 suele ser falling fiable)
-    bool           invert        = false;   // invierte signo si aplicas dirección externa
-    uint16_t       glitchCycles  = 0;       // filtro HW: 0..1023 (≈12.8us a 80MHz)
-    uint32_t       minGapUs      = 0;       // ventana lógica adicional (us)
-    float          alphaPeriod   = 0.25f;   // EMA del periodo por sector
-    uint32_t       timeoutStopMs = 2000;    // declara 0 rpm si no hay pulsos (ms)
+    int            pulsesPerRev;     // PPR efectivos (nº imanes)
+    bool           countRising = false; // true: rising, false: falling (KY-003 suele ser falling fiable)
+    bool           invert = false;      // invierte signo de lectura si usas dirección externa
+    uint16_t       glitchCycles = 0;    // filtro HW: ciclos APB (80MHz). 0..1023 (0=off). p.ej. 1023 ≈ 12.8us
+    uint32_t       minGapUs = 0;        // ventana lógica adicional (us), p.ej. 500
+    float          alphaPeriod = 0.25f; // EMA del período [0..1)
+    uint32_t       timeoutStopMs = 2000;// declara 0 rpm si no hay pulsos (ms)
   };
 
   explicit EncoderPCNT(const Config& cfg);
 
-  // HW + ISR
+  // Inicializa PCNT, filtros y servicio ISR
   void begin();
 
-  // Llamar a 100–200 Hz (dt en segundos). Consume pulsos y actualiza rpm/omega
+  // Consumir pulsos y actualizar rpm/omega (llamar a 100–200 Hz)
   void update(float dt_s);
 
   // Lecturas
-  float rpm()   const { return _rpm; }         // RPM actuales (suavizadas)
-  float omega() const { return _omega; }       // rad/s
-  long  count() const { return _totalCount; }  // ticks acumulados SW
+  float rpm()   const { return _rpm; }          // RPM actuales (suavizadas)
+  float omega() const { return _omega; }        // rad/s (≥0; magnitud)
+  long  count() const { return _totalCount; }   // ticks SW acumulados
   uint32_t lastSeenMs() const { return _lastSeenMs; }
 
-  // Utilidades
-  void zero();
-  void setInvert(bool inv) { _cfg.invert = inv; }
-
-  // Calibrador (opcional)
-  void attachCalibrator(SectorCalibrator* cal) { _cal = cal; }
-  void setSectorIdx(uint16_t k) { _sectorIdx = (k % _ppr); }
+  // Sector actual y dirección de indexado
+  void     setSectorIdx(uint16_t k) { _sectorIdx = (k % _ppr); }
   uint16_t sectorIdx() const { return _sectorIdx; }
 
-  // Fase de la LUT (desplazamiento aplicado al indexado de s[k])
-  void setLUTPhase(uint16_t off) { _lutPhase = (int16_t)(off % _ppr); }
-  int16_t lutPhase() const { return _lutPhase; }
+  // +1: k++ por pulso; -1: k-- por pulso (para casar LUT con el sentido real)
+  void  setStepDirection(int dir) { _stepDir = (dir >= 0) ? +1 : -1; }
+  int   stepDirection() const { return _stepDir; }
 
-  // Dirección de paso del índice de sector (+1 = k++, -1 = k--)
-  void   setStepDirection(int8_t dir) { _stepDir = (dir >= 0) ? +1 : -1; }
-  int8_t stepDirection() const { return _stepDir; }
+  // Integración con calibrador/LUT
+  void attachCalibrator(SectorCalibrator* cal) { _cal = cal; }
 
-  // Log
+  // Utilidades
+  void zero();                    // borra contador SW y HW
+  void setInvert(bool inv) { _cfg.invert = inv; }
+  void printDebugEvery(uint32_t periodMs = 200);
+
+  // Logging opcional
   void setLog(Stream* s) { _log = s; }
-  void printDebugEvery(uint32_t periodMs);
 
 private:
-  // ISR
-  static void _isrHandler(void* arg);
+  // ---- ISR ----
+  static void IRAM_ATTR _pcnt_isr(void* arg);
+  void IRAM_ATTR _onPulseIsr(uint32_t nowUs);
 
-  // Helpers
+  // ---- Helpers ----
   void _setupPCNT();
-  int16_t _readAndClearHW();  // lee delta de PCNT y limpia
-  void    _applyPeriodAndCompute(uint32_t dt_us);
+  void _applyPeriodAndCompute(uint32_t dt_us);
 
-  // Estado
+private:
   Config   _cfg;
-  int      _countsPerRev;
-  uint16_t _ppr         = 1;      // PPR para sectorizado
-  uint16_t _sectorIdx   = 0;      // sector actual [0.._ppr-1]
-  int16_t  _lutPhase    = 0;      // desplazamiento de fase para LUT
-  int8_t   _stepDir     = +1;     // +1: k++; -1: k--
+  int      _ppr;                // copia de pulsesPerRev
 
   // Calibrador
   SectorCalibrator* _cal = nullptr;
 
-  // Compartido con ISR
-  volatile uint32_t _isrCount     = 0;
-  volatile uint32_t _isrLastUs    = 0;
-  volatile uint32_t _isrPeriodUs  = 0;
-  portMUX_TYPE      _mux          = portMUX_INITIALIZER_UNLOCKED;
+  // Dirección de indexado (+1/-1)
+  int8_t   _stepDir = +1;
 
-  // SW
+  // Estado de sectores
+  uint16_t _sectorIdx = 0;
+
+  // Snapshots escritos por ISR (protegidos con portMUX)
+  volatile uint32_t _isrCount    = 0;   // # pulsos aceptados
+  volatile uint32_t _isrLastUs   = 0;   // timestamp último pulso aceptado
+  volatile uint32_t _isrPeriodUs = 0;   // último período válido (us)
+  portMUX_TYPE      _mux         = portMUX_INITIALIZER_UNLOCKED;
+
+  // Estado SW
   long     _totalCount   = 0;
   float    _periodEmaUs  = 0.0f;
   float    _rpm          = 0.0f;
-  float    _omega        = 0.0f;
+  float    _omega        = 0.0f;  // magnitud (>=0)
   uint32_t _lastSeenMs   = 0;
 
-  // Debug / logging
+  // Debug / Log
+  Stream*  _log          = nullptr;
   uint32_t _dbgLastMs    = 0;
   uint32_t _dbgLastCount = 0;
-  Stream*  _log          = nullptr;
 };
 
 #endif // ENCODER_PCNT_H

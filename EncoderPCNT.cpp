@@ -1,6 +1,7 @@
 #include "EncoderPCNT.h"
 #include "SectorCalibrator.h"
 
+// Macro de log local
 #define ENC_LOGF(fmt, ...) do { if (_log) _log->printf(fmt, ##__VA_ARGS__); } while(0)
 
 // =======================
@@ -8,8 +9,7 @@
 // =======================
 EncoderPCNT::EncoderPCNT(const Config& cfg)
 : _cfg(cfg),
-  _countsPerRev(max(1, cfg.pulsesPerRev)),
-  _ppr(static_cast<uint16_t>(max(1, cfg.pulsesPerRev)))
+  _ppr(max(1, cfg.pulsesPerRev))
 {}
 
 void EncoderPCNT::begin() {
@@ -18,9 +18,6 @@ void EncoderPCNT::begin() {
   _lastSeenMs  = millis();
   _periodEmaUs = 0.0f;
   _rpm = _omega = 0.0f;
-  _sectorIdx = 0;
-  _lutPhase  = 0;              // <-- reset de fase LUT
-  _stepDir   = +1;
 }
 
 void EncoderPCNT::update(float /*dt_s*/) {
@@ -42,12 +39,12 @@ void EncoderPCNT::update(float /*dt_s*/) {
   }
 
   // Consume nuevos pulsos
-  uint32_t pulses = cntSnap - lastConsumed;
+  uint32_t delta = cntSnap - lastConsumed;
   lastConsumed = cntSnap;
 
-  // Consume cada dt_us individualmente (si hay más de 1 pulso acumulado)
-  // Usamos perSnap como estimación de todos ellos (suficiente para este flujo)
-  for (uint32_t i = 0; i < pulses; ++i) {
+  // Si delta > 1 no tenemos cola de periodos; usamos el último válido (simple).
+  for (uint32_t i = 0; i < delta; ++i) {
+    if (perSnap == 0) continue; // ignora primer pulso tras arranque
     _applyPeriodAndCompute(perSnap);
   }
 }
@@ -62,9 +59,6 @@ void EncoderPCNT::zero() {
   _totalCount = 0;
   _periodEmaUs = 0.0f;
   _rpm = _omega = 0.0f;
-  _sectorIdx = 0;
-  _lutPhase  = 0;              // <-- reset de fase LUT
-  _stepDir   = +1;
 
   // Limpia HW
   pcnt_counter_pause(_cfg.unit);
@@ -75,104 +69,67 @@ void EncoderPCNT::zero() {
 void EncoderPCNT::printDebugEvery(uint32_t periodMs) {
   const uint32_t now = millis();
   if (now - _dbgLastMs < periodMs) return;
+
+  // snapshot atómico del contador de ISR
+  uint32_t cntSnap;
+  portENTER_CRITICAL(&_mux);
+  cntSnap = _isrCount;
+  portEXIT_CRITICAL(&_mux);
+
+  const uint32_t d = cntSnap - _dbgLastCount;
+  _dbgLastCount = cntSnap;
   _dbgLastMs = now;
 
-  const uint32_t dcnt = _isrCount - _dbgLastCount;
-  _dbgLastCount = _isrCount;
-
   if (_log) {
-    _log->printf("cnt:%lu rpm:%.2f omg:%.3f perEMA:%.1f us k:%u lutPhase:%d dir:%d\n",
-                 (unsigned long)_isrCount, (double)_rpm, (double)_omega,
-                 (double)_periodEmaUs, (unsigned)_sectorIdx, (int)_lutPhase, (int)_stepDir);
-  }
-}
-
-// =======================
-//  Privado
-// =======================
-void IRAM_ATTR EncoderPCNT::_isrHandler(void* arg) {
-  EncoderPCNT* self = reinterpret_cast<EncoderPCNT*>(arg);
-  const uint32_t now = micros();
-
-  // Lee y limpia
-  const int16_t delta = self->_readAndClearHW();
-  if (delta <= 0) return; // contamos sólo en un flanco
-
-  // Ventana lógica (minGapUs)
-  if (self->_cfg.minGapUs) {
-    const uint32_t gap = now - self->_isrLastUs;
-    if (gap < self->_cfg.minGapUs) return;
-  }
-
-  self->_isrCount += 1;
-  self->_isrPeriodUs = now - self->_isrLastUs;
-  self->_isrLastUs = now;
-}
-
-int16_t IRAM_ATTR EncoderPCNT::_readAndClearHW() {
-  int16_t val = 0;
-  pcnt_get_counter_value(_cfg.unit, &val);
-  pcnt_counter_clear(_cfg.unit);
-  return val;
-}
-
-void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
-  float dt = (float)dt_us;
-
-  // 1) Integración con calibrador (calibración/alineación + corrección LUT)
-  if (_cal) {
-    if (_cal->isCalibrating() || _cal->isAligning()) {
-      _cal->feedPeriod(_sectorIdx, dt);
-      if (_cal->isCalibrating()) _cal->finishCalibrationIfReady();
-      if (_cal->isAligning()) {
-        uint16_t off; float score;
-        if (_cal->finishAlignmentIfReady(off, score)) {
-          ENC_LOGF("[ALIGN] Offset aplicado=%u  score=%.4f\n", (unsigned)off, (double)score);
-          _lutPhase  = (int16_t)off; // aplica fase de LUT (no toca _sectorIdx)
-          _periodEmaUs = 0.0f;       // bumpless
-          _rpm = _omega = 0.0f;
-        }
-      }
-    }
-    // Corrección LUT en operación normal (usa sector desplazado por _lutPhase)
-    const uint16_t k_corr = (uint16_t)((_sectorIdx + (_lutPhase>=0? _lutPhase : (_ppr + (_lutPhase % (int)_ppr)))) % _ppr);
-    dt = _cal->correctDt(k_corr, dt);
-  }
-
-  // 2) EMA del periodo
-  if (_periodEmaUs <= 0.0f) _periodEmaUs = dt;
-  else {
-    const float a = _cfg.alphaPeriod;
-    _periodEmaUs = (1.0f - a) * _periodEmaUs + a * dt;
-  }
-
-  // 3) Convierte a rpm/omega
-  if (_periodEmaUs > 0.0f) {
-    const float rev_per_s = 1.0e6f / ( (_countsPerRev * _periodEmaUs) );
-    float rpm   = 60.0f * rev_per_s;
-    float omega = 2.0f * PI * rev_per_s;
-    if (_cfg.invert) { rpm = -rpm; omega = -omega; }
-    _rpm = rpm; _omega = omega; _lastSeenMs = millis();
-    _totalCount += 1;
-  }
-
-  // 4) Avanza sector según dirección actual (+1: k++, -1: k--)
-  if (_stepDir > 0) {
-    _sectorIdx = (_sectorIdx + 1) % _ppr;
+    _log->printf(
+      "[ENC] cnt:%6lu | pps*:%4lu | RPM:%7.3f | Omega:%7.3f rad/s | perEMA:%9.1f us | sector:%2u | dir:%+d\n",
+      (unsigned long)cntSnap, (unsigned long)d, _rpm, _omega, _periodEmaUs, (unsigned)_sectorIdx, (int)_stepDir
+    );
   } else {
-    _sectorIdx = (_sectorIdx == 0) ? (_ppr - 1) : (_sectorIdx - 1);
+    Serial.printf(
+      "[ENC] cnt:%6lu | pps*:%4lu | RPM:%7.3f | Omega:%7.3f rad/s | perEMA:%9.1f us | sector:%2u | dir:%+d\n",
+      (unsigned long)cntSnap, (unsigned long)d, _rpm, _omega, _periodEmaUs, (unsigned)_sectorIdx, (int)_stepDir
+    );
   }
 }
 
 // =======================
-//  Setup PCNT
+//  Privado (ISR y helpers)
 // =======================
+void IRAM_ATTR EncoderPCNT::_pcnt_isr(void* arg) {
+  auto* self = static_cast<EncoderPCNT*>(arg);
+  const uint32_t now = micros();
+  self->_onPulseIsr(now);
+  // Rearmar umbral para que cada 1 vuelva a disparar
+  pcnt_counter_clear(self->_cfg.unit);
+}
+
+void IRAM_ATTR EncoderPCNT::_onPulseIsr(uint32_t nowUs) {
+  // Ventana lógica (MIN GAP)
+  if (_cfg.minGapUs > 0) {
+    const uint32_t gap = nowUs - _isrLastUs;
+    if (_isrLastUs != 0 && gap < _cfg.minGapUs) {
+      return; // rebote/ruido
+    }
+  }
+
+  const uint32_t period = (_isrLastUs == 0) ? 0 : (nowUs - _isrLastUs);
+
+  portENTER_CRITICAL_ISR(&_mux);
+  _isrLastUs = nowUs;
+  if (period) _isrPeriodUs = period;  // guarda último periodo válido
+  _isrCount++;
+  portEXIT_CRITICAL_ISR(&_mux);
+}
+
 void EncoderPCNT::_setupPCNT() {
-  pcnt_config_t c{};
+  pcnt_config_t c = {};
   c.pulse_gpio_num = _cfg.pin;
-  c.ctrl_gpio_num  = -1; // sin dir por pin
+  c.ctrl_gpio_num  = PCNT_PIN_NOT_USED;
+
+  // Elegimos flanco: rising o falling
   if (_cfg.countRising) {
-    c.pos_mode = PCNT_COUNT_INC; // rising
+    c.pos_mode = PCNT_COUNT_INC;
     c.neg_mode = PCNT_COUNT_DIS;
   } else {
     c.pos_mode = PCNT_COUNT_DIS;
@@ -191,15 +148,78 @@ void EncoderPCNT::_setupPCNT() {
     ESP_ERROR_CHECK(pcnt_set_filter_value(_cfg.unit, _cfg.glitchCycles));
     ESP_ERROR_CHECK(pcnt_filter_enable(_cfg.unit));
   } else {
-    ESP_ERROR_CHECK(pcnt_filter_disable(_cfg.unit));
+    pcnt_filter_disable(_cfg.unit);
   }
 
-  // Interrupción por pulso (nosotros consultamos con update())
+  // Evento por pulso: THRES_0=1
+  ESP_ERROR_CHECK(pcnt_set_event_value(_cfg.unit, PCNT_EVT_THRES_0, 1));
+  ESP_ERROR_CHECK(pcnt_event_enable(_cfg.unit, PCNT_EVT_THRES_0));
+
+  // Preparar y arrancar
   ESP_ERROR_CHECK(pcnt_counter_pause(_cfg.unit));
   ESP_ERROR_CHECK(pcnt_counter_clear(_cfg.unit));
-  ESP_ERROR_CHECK(pcnt_event_enable(_cfg.unit, PCNT_EVT_THRES_1));
-  ESP_ERROR_CHECK(pcnt_intr_enable(_cfg.unit));
-  pcnt_isr_service_install(0);
-  pcnt_isr_handler_add(_cfg.unit, &EncoderPCNT::_isrHandler, this);
   ESP_ERROR_CHECK(pcnt_counter_resume(_cfg.unit));
+
+  // Instalar ISR y registrar handler con "this" como arg
+  static bool isrInstalled = false;
+  if (!isrInstalled) {
+    ESP_ERROR_CHECK(pcnt_isr_service_install(0)); // ISR en IRAM
+    isrInstalled = true;
+  }
+  ESP_ERROR_CHECK(pcnt_isr_handler_add(_cfg.unit, &EncoderPCNT::_pcnt_isr, this));
+}
+
+void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
+  float dt = (float)dt_us;
+
+  // 1) Integración con calibrador
+  if (_cal) {
+    // Alimentar buffers en cal/align y gestionar cierres
+    if (_cal->isCalibrating() || _cal->isAligning()) {
+      _cal->feedPeriod(_sectorIdx, dt);
+
+      if (_cal->isCalibrating()) {
+        _cal->finishCalibrationIfReady();
+      }
+      if (_cal->isAligning()) {
+        uint16_t off; float score;
+        if (_cal->finishAlignmentIfReady(off, score)) {
+          _sectorIdx = (off + _ppr - 1) % _ppr;      // aplica offset inicial
+          _periodEmaUs = 0.0f;   // bumpless
+          _rpm = _omega = 0.0f;
+          ENC_LOGF("[ENC] ALIGN applied: off=%u score=%.4f\n", (unsigned)off, (double)score);
+        }
+      }
+    }
+
+    // Corrección LUT en operación normal (el índice _sectorIdx sigue el sentido real con _stepDir)
+    dt = _cal->correctDt(_sectorIdx, dt);
+  }
+
+  // 2) EMA de periodo
+  if (_periodEmaUs <= 0.0f) _periodEmaUs = dt;
+  else {
+    const float a = _cfg.alphaPeriod;
+    _periodEmaUs = (1.0f - a) * _periodEmaUs + a * dt;
+  }
+
+  // 3) Convierte a rpm/omega (magnitud)
+  if (_periodEmaUs > 0.0f) {
+    const float rev_per_s = 1.0e6f / (static_cast<float>(_ppr) * _periodEmaUs);
+    float rpm   = 60.0f * rev_per_s;
+    float omega = 2.0f * PI * rev_per_s;
+
+    if (_cfg.invert) { rpm = -rpm; omega = -omega; } // si quisieras leer con signo
+    _rpm   = fabsf(rpm);     // exponer magnitud para el PID por |ω|
+    _omega = fabsf(omega);
+    _lastSeenMs = millis();
+    _totalCount += 1; // SW (por pulso)
+  }
+
+  // 4) Avanza/retrocede sector según _stepDir
+  if (_stepDir >= 0) {
+    _sectorIdx = (uint16_t)((_sectorIdx + 1) % _ppr);
+  } else {
+    _sectorIdx = (uint16_t)((_sectorIdx + _ppr - 1) % _ppr);
+  }
 }

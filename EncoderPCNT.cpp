@@ -19,6 +19,7 @@ void EncoderPCNT::begin() {
   _periodEmaUs = 0.0f;
   _rpm = _omega = 0.0f;
   _sectorIdx = 0;
+  _lutPhase  = 0;              // <-- reset de fase LUT
   _stepDir   = +1;
 }
 
@@ -41,12 +42,12 @@ void EncoderPCNT::update(float /*dt_s*/) {
   }
 
   // Consume nuevos pulsos
-  uint32_t delta = cntSnap - lastConsumed;
+  uint32_t pulses = cntSnap - lastConsumed;
   lastConsumed = cntSnap;
 
-  // Si delta > 1 no tenemos cola de periodos; usamos el último válido (simple).
-  for (uint32_t i = 0; i < delta; ++i) {
-    if (perSnap == 0) continue; // ignora primer pulso tras arranque
+  // Consume cada dt_us individualmente (si hay más de 1 pulso acumulado)
+  // Usamos perSnap como estimación de todos ellos (suficiente para este flujo)
+  for (uint32_t i = 0; i < pulses; ++i) {
     _applyPeriodAndCompute(perSnap);
   }
 }
@@ -62,6 +63,7 @@ void EncoderPCNT::zero() {
   _periodEmaUs = 0.0f;
   _rpm = _omega = 0.0f;
   _sectorIdx = 0;
+  _lutPhase  = 0;              // <-- reset de fase LUT
   _stepDir   = +1;
 
   // Limpia HW
@@ -73,100 +75,41 @@ void EncoderPCNT::zero() {
 void EncoderPCNT::printDebugEvery(uint32_t periodMs) {
   const uint32_t now = millis();
   if (now - _dbgLastMs < periodMs) return;
-
-  // snapshot atómico del contador de ISR
-  uint32_t cntSnap;
-  portENTER_CRITICAL(&_mux);
-  cntSnap = _isrCount;
-  portEXIT_CRITICAL(&_mux);
-
-  const uint32_t d = cntSnap - _dbgLastCount;
-  _dbgLastCount = cntSnap;
   _dbgLastMs = now;
 
-  Serial.printf(
-    "PCNT cnt:%6lu | pps*:%4lu | RPM:%7.3f | Omega:%7.3f rad/s | perEMA:%9.1f us | sector:%2u | dir:%+d\n",
-    (unsigned long)cntSnap, (unsigned long)d, _rpm, _omega, _periodEmaUs,
-    (unsigned)_sectorIdx, (int)_stepDir
-  );
+  const uint32_t dcnt = _isrCount - _dbgLastCount;
+  _dbgLastCount = _isrCount;
+
+  if (_log) {
+    _log->printf("cnt:%lu rpm:%.2f omg:%.3f perEMA:%.1f us k:%u lutPhase:%d dir:%d\n",
+                 (unsigned long)_isrCount, (double)_rpm, (double)_omega,
+                 (double)_periodEmaUs, (unsigned)_sectorIdx, (int)_lutPhase, (int)_stepDir);
+  }
 }
 
 // =======================
-//  Privado (ISR y helpers)
+//  Privado
 // =======================
-void IRAM_ATTR EncoderPCNT::_pcnt_isr(void* arg) {
-  auto* self = static_cast<EncoderPCNT*>(arg);
+void IRAM_ATTR EncoderPCNT::_isrHandler(void* arg) {
+  EncoderPCNT* self = reinterpret_cast<EncoderPCNT*>(arg);
   const uint32_t now = micros();
-  self->_onPulseIsr(now);
-  // Rearmar umbral para que cada 1 vuelva a disparar
-  pcnt_counter_clear(self->_cfg.unit);
+
+  // Lee y limpia
+  const int16_t delta = self->_readAndClearHW();
+  if (delta <= 0) return; // contamos sólo en un flanco
+
+  // Ventana lógica (minGapUs)
+  if (self->_cfg.minGapUs) {
+    const uint32_t gap = now - self->_isrLastUs;
+    if (gap < self->_cfg.minGapUs) return;
+  }
+
+  self->_isrCount += 1;
+  self->_isrPeriodUs = now - self->_isrLastUs;
+  self->_isrLastUs = now;
 }
 
-void IRAM_ATTR EncoderPCNT::_onPulseIsr(uint32_t nowUs) {
-  // Ventana lógica (MIN GAP)
-  if (_cfg.minGapUs > 0) {
-    const uint32_t gap = nowUs - _isrLastUs;
-    if (_isrLastUs != 0 && gap < _cfg.minGapUs) {
-      return; // rebote/ruido
-    }
-  }
-
-  const uint32_t period = (_isrLastUs == 0) ? 0 : (nowUs - _isrLastUs);
-
-  portENTER_CRITICAL_ISR(&_mux);
-  _isrLastUs = nowUs;
-  if (period) _isrPeriodUs = period;  // guarda último periodo válido
-  _isrCount++;
-  portEXIT_CRITICAL_ISR(&_mux);
-}
-
-void EncoderPCNT::_setupPCNT() {
-  pcnt_config_t c = {};
-  c.pulse_gpio_num = _cfg.pin;
-  c.ctrl_gpio_num  = PCNT_PIN_NOT_USED;
-  // Elegimos flanco: rising o falling
-  if (_cfg.countRising) {
-    c.pos_mode = PCNT_COUNT_INC;
-    c.neg_mode = PCNT_COUNT_DIS;
-  } else {
-    c.pos_mode = PCNT_COUNT_DIS;
-    c.neg_mode = PCNT_COUNT_INC; // falling
-  }
-  c.lctrl_mode = PCNT_MODE_KEEP;
-  c.hctrl_mode = PCNT_MODE_KEEP;
-  c.counter_h_lim = 32767;
-  c.counter_l_lim = 0;
-  c.unit    = _cfg.unit;
-  c.channel = _cfg.channel;
-  ESP_ERROR_CHECK(pcnt_unit_config(&c));
-
-  // Filtro HW (glitch)
-  if (_cfg.glitchCycles > 0) {
-    ESP_ERROR_CHECK(pcnt_set_filter_value(_cfg.unit, _cfg.glitchCycles));
-    ESP_ERROR_CHECK(pcnt_filter_enable(_cfg.unit));
-  } else {
-    pcnt_filter_disable(_cfg.unit);
-  }
-
-  // Evento por pulso: THRES_0=1
-  ESP_ERROR_CHECK(pcnt_set_event_value(_cfg.unit, PCNT_EVT_THRES_0, 1));
-  ESP_ERROR_CHECK(pcnt_event_enable(_cfg.unit, PCNT_EVT_THRES_0));
-
-  // Preparar y arrancar
-  ESP_ERROR_CHECK(pcnt_counter_pause(_cfg.unit));
-  ESP_ERROR_CHECK(pcnt_counter_clear(_cfg.unit));
-  ESP_ERROR_CHECK(pcnt_counter_resume(_cfg.unit));
-
-  // Instalar ISR y registrar handler con "this" como arg
-  static bool isrInstalled = false;
-  if (!isrInstalled) {
-    ESP_ERROR_CHECK(pcnt_isr_service_install(0)); // ISR en IRAM
-    isrInstalled = true;
-  }
-  ESP_ERROR_CHECK(pcnt_isr_handler_add(_cfg.unit, &EncoderPCNT::_pcnt_isr, this));
-}
-
-int16_t EncoderPCNT::_readAndClearHW() {
+int16_t IRAM_ATTR EncoderPCNT::_readAndClearHW() {
   int16_t val = 0;
   pcnt_get_counter_value(_cfg.unit, &val);
   pcnt_counter_clear(_cfg.unit);
@@ -185,14 +128,15 @@ void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
         uint16_t off; float score;
         if (_cal->finishAlignmentIfReady(off, score)) {
           ENC_LOGF("[ALIGN] Offset aplicado=%u  score=%.4f\n", (unsigned)off, (double)score);
-          _sectorIdx = off;      // aplica offset inicial
-          _periodEmaUs = 0.0f;   // bumpless
+          _lutPhase  = (int16_t)off; // aplica fase de LUT (no toca _sectorIdx)
+          _periodEmaUs = 0.0f;       // bumpless
           _rpm = _omega = 0.0f;
         }
       }
     }
-    // Corrección LUT en operación normal
-    dt = _cal->correctDt(_sectorIdx, dt);
+    // Corrección LUT en operación normal (usa sector desplazado por _lutPhase)
+    const uint16_t k_corr = (uint16_t)((_sectorIdx + (_lutPhase>=0? _lutPhase : (_ppr + (_lutPhase % (int)_ppr)))) % _ppr);
+    dt = _cal->correctDt(k_corr, dt);
   }
 
   // 2) EMA del periodo
@@ -218,4 +162,44 @@ void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
   } else {
     _sectorIdx = (_sectorIdx == 0) ? (_ppr - 1) : (_sectorIdx - 1);
   }
+}
+
+// =======================
+//  Setup PCNT
+// =======================
+void EncoderPCNT::_setupPCNT() {
+  pcnt_config_t c{};
+  c.pulse_gpio_num = _cfg.pin;
+  c.ctrl_gpio_num  = -1; // sin dir por pin
+  if (_cfg.countRising) {
+    c.pos_mode = PCNT_COUNT_INC; // rising
+    c.neg_mode = PCNT_COUNT_DIS;
+  } else {
+    c.pos_mode = PCNT_COUNT_DIS;
+    c.neg_mode = PCNT_COUNT_INC; // falling
+  }
+  c.lctrl_mode = PCNT_MODE_KEEP;
+  c.hctrl_mode = PCNT_MODE_KEEP;
+  c.counter_h_lim = 32767;
+  c.counter_l_lim = 0;
+  c.unit    = _cfg.unit;
+  c.channel = _cfg.channel;
+  ESP_ERROR_CHECK(pcnt_unit_config(&c));
+
+  // Filtro HW (glitch)
+  if (_cfg.glitchCycles > 0) {
+    ESP_ERROR_CHECK(pcnt_set_filter_value(_cfg.unit, _cfg.glitchCycles));
+    ESP_ERROR_CHECK(pcnt_filter_enable(_cfg.unit));
+  } else {
+    ESP_ERROR_CHECK(pcnt_filter_disable(_cfg.unit));
+  }
+
+  // Interrupción por pulso (nosotros consultamos con update())
+  ESP_ERROR_CHECK(pcnt_counter_pause(_cfg.unit));
+  ESP_ERROR_CHECK(pcnt_counter_clear(_cfg.unit));
+  ESP_ERROR_CHECK(pcnt_event_enable(_cfg.unit, PCNT_EVT_THRES_1));
+  ESP_ERROR_CHECK(pcnt_intr_enable(_cfg.unit));
+  pcnt_isr_service_install(0);
+  pcnt_isr_handler_add(_cfg.unit, &EncoderPCNT::_isrHandler, this);
+  ESP_ERROR_CHECK(pcnt_counter_resume(_cfg.unit));
 }

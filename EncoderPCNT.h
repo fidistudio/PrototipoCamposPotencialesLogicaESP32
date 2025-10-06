@@ -14,8 +14,6 @@ class SectorCalibrator;
 //  - Ventana lógica (min gap us)
 //  - Estima RPM y rad/s con EMA
 //  - Aplica LUT sectorial (si hay calibrador)
-//  - Índice de sector avanza según dirección (+1/-1)
-// ==============================
 class EncoderPCNT {
 public:
   struct Config {
@@ -54,20 +52,21 @@ public:
   void setSectorIdx(uint16_t k) { _sectorIdx = (k % _ppr); }
   uint16_t sectorIdx() const { return _sectorIdx; }
 
+  // Fase de la LUT (desplazamiento aplicado al indexado de s[k])
+  void setLUTPhase(uint16_t off) { _lutPhase = (int16_t)(off % _ppr); }
+  int16_t lutPhase() const { return _lutPhase; }
+
   // Dirección de paso del índice de sector (+1 = k++, -1 = k--)
   void   setStepDirection(int8_t dir) { _stepDir = (dir >= 0) ? +1 : -1; }
   int8_t stepDirection() const { return _stepDir; }
 
-  // Debug
-  void printDebugEvery(uint32_t periodMs = 200);
-
-  // Logging (opcional)
+  // Log
   void setLog(Stream* s) { _log = s; }
+  void printDebugEvery(uint32_t periodMs);
 
 private:
   // ISR
-  static void IRAM_ATTR _pcnt_isr(void* arg);
-  void IRAM_ATTR _onPulseIsr(uint32_t nowUs);
+  static void _isrHandler(void* arg);
 
   // Helpers
   void _setupPCNT();
@@ -79,6 +78,7 @@ private:
   int      _countsPerRev;
   uint16_t _ppr         = 1;      // PPR para sectorizado
   uint16_t _sectorIdx   = 0;      // sector actual [0.._ppr-1]
+  int16_t  _lutPhase    = 0;      // desplazamiento de fase para LUT
   int8_t   _stepDir     = +1;     // +1: k++; -1: k--
 
   // Calibrador

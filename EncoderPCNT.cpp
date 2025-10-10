@@ -172,7 +172,7 @@ void EncoderPCNT::_setupPCNT() {
 void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
   float dt = (float)dt_us;
 
-  // 1) Integración con calibrador
+  // 1) Integración con calibrador (dual LUT)
   if (_cal) {
     // Alimentar buffers en cal/align y gestionar cierres
     if (_cal->isCalibrating() || _cal->isAligning()) {
@@ -184,16 +184,18 @@ void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
       if (_cal->isAligning()) {
         uint16_t off; float score;
         if (_cal->finishAlignmentIfReady(off, score)) {
-          _sectorIdx = (off + _ppr - 1) % _ppr;      // aplica offset inicial
+          // ¡OJO! Ya NO tocamos _sectorIdx.
+          // El offset queda persistido por sentido dentro del calibrador.
           _periodEmaUs = 0.0f;   // bumpless
           _rpm = _omega = 0.0f;
-          ENC_LOGF("[ENC] ALIGN applied: off=%u score=%.4f\n", (unsigned)off, (double)score);
+          ENC_LOGF("[ENC] ALIGN stored (dir=%+d): off=%u score=%.4f\n",
+                   (int)_stepDir, (unsigned)off, (double)score);
         }
       }
     }
 
-    // Corrección LUT en operación normal (el índice _sectorIdx sigue el sentido real con _stepDir)
-    dt = _cal->correctDt(_sectorIdx, dt);
+    // Corrección LUT por sentido (aplica offset interno del sentido activo)
+    dt = _cal->correctDtDir(_sectorIdx, dt, _stepDir);
   }
 
   // 2) EMA de periodo
@@ -209,8 +211,8 @@ void EncoderPCNT::_applyPeriodAndCompute(uint32_t dt_us) {
     float rpm   = 60.0f * rev_per_s;
     float omega = 2.0f * PI * rev_per_s;
 
-    if (_cfg.invert) { rpm = -rpm; omega = -omega; } // si quisieras leer con signo
-    _rpm   = fabsf(rpm);     // exponer magnitud para el PID por |ω|
+    if (_cfg.invert) { rpm = -rpm; omega = -omega; }
+    _rpm   = fabsf(rpm);
     _omega = fabsf(omega);
     _lastSeenMs = millis();
     _totalCount += 1; // SW (por pulso)

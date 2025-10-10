@@ -12,8 +12,8 @@ class SectorCalibrator;
 //  - Cuenta pulsos con PCNT (ESP32)
 //  - Filtro HW antirruido (glitch) + ventana lógica (minGapUs)
 //  - Estima RPM y rad/s con EMA del periodo
-//  - Índice de sector con dirección (+1/-1) para casar LUT en ambos sentidos
-//  - Integra calibración/alineación por sectores via SectorCalibrator
+//  - Índice de sector con dirección (+1/-1) para casar LUT por sentido
+//  - Integra calibración/alineación por sectores via SectorCalibrator (dual LUT)
 // ==============================
 class EncoderPCNT {
 public:
@@ -24,9 +24,9 @@ public:
     int            pulsesPerRev;     // PPR efectivos (nº imanes)
     bool           countRising = false; // true: rising, false: falling (KY-003 suele ser falling fiable)
     bool           invert = false;      // invierte signo de lectura si usas dirección externa
-    uint16_t       glitchCycles = 0;    // filtro HW: ciclos APB (80MHz). 0..1023 (0=off). p.ej. 1023 ≈ 12.8us
+    uint16_t       glitchCycles = 0;    // filtro HW: ciclos APB (80MHz). 0..1023 (0=off)
     uint32_t       minGapUs = 0;        // ventana lógica adicional (us), p.ej. 500
-    float          alphaPeriod = 0.25f; // EMA del período [0..1)
+    float          alphaPeriod = 1.0f;  // EMA del período [0..1) 1 sin filtro, 0 retardo infinito
     uint32_t       timeoutStopMs = 2000;// declara 0 rpm si no hay pulsos (ms)
   };
 
@@ -48,7 +48,7 @@ public:
   void     setSectorIdx(uint16_t k) { _sectorIdx = (k % _ppr); }
   uint16_t sectorIdx() const { return _sectorIdx; }
 
-  // +1: k++ por pulso; -1: k-- por pulso (para casar LUT con el sentido real)
+  // +1: k++ por pulso; -1: k-- por pulso (para casar LUT del sentido real)
   void  setStepDirection(int dir) { _stepDir = (dir >= 0) ? +1 : -1; }
   int   stepDirection() const { return _stepDir; }
 

@@ -29,8 +29,8 @@ public:
 
     // Comando
     bool     invert          = false; // invierte el signo lógico de u
-    float    deadband        = 0.02f; // porcentaje de neutral (|u|<db -> 0)  (0..0.2 sug.)
-    float    minOutput       = 0.08f; // piso de duty para vencer fricción    (0..0.3 sug.)
+    float    deadband        = 0.0f; // porcentaje de neutral (|u|<db -> 0)  (0..0.2 sug.)
+    float    minOutput       = 0.0f; // piso de duty para vencer fricción    (0..0.3 sug.)
     float    slewRatePerSec  = 0.0f;  // máx Δ|u| por segundo (rampa)         (0 desactiva)
 
     // Comportamiento para IBT-4

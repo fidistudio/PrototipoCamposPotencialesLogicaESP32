@@ -11,9 +11,9 @@
 // Wheel — Rueda diferencial con Motor + Encoder + PID + LUT
 // - Entrada: omega_ref (rad/s, con signo).
 // - PID por magnitud (|u|), signo desde omega_ref.
-// - Alineación/Calibración LUT con asistente (u=+assistU).
+// - Alineación/Calibración LUT con asistente (u=±assistU según sentido).
 // - Ajusta enc.setStepDirection(+1/-1) según signo aplicado.
-// - Getters isCalibrating()/isAligning() expuestos para coordinación.
+// - Compatibilidad LUT dual (FWD/REV) sin perder alineación por sentido.
 // ============================================================
 class Wheel {
 public:
@@ -24,15 +24,15 @@ public:
     SectorCalibrator::Config cal;
     PIDVel::Config           pid;
 
-    // Asistente para cal/align (u positivo sostenido)
+    // Asistente para cal/align (u sostenido)
     bool  assistOnBoot = true;  // si hay patrón/LUT, permite usar asistente en rutinas
-    float assistU      = 0.50f; // u a sostener durante cal/align (sentido +)
+    float assistU      = 0.50f; // |u| a sostener durante cal/align
 
     // Parámetros de dirección (histeresis cerca de 0)
     float    dirEpsU    = 0.05f;  // umbral de |u_applied| para fijar signo
     uint32_t dirHoldMs  = 200;    // retener signo cuando estamos cerca de 0
 
-    // Alineación automática al boot (si hay LUT/patrón)
+    // Alineación automática al boot (si hay LUT/patrón) — se intenta en el sentido actual
     bool    autoAlignOnBoot = true;
     uint8_t alignLapsBoot   = 3;
   };
@@ -50,17 +50,22 @@ public:
   void  update(float dt_s);
 
   // --- Calibración / Alineación LUT ---
-  bool  startCalibration(uint8_t lapsN); // fuerza k++ y, si assist ON, fija u=+assistU
-  bool  startAlignment(uint8_t lapsN);   // requiere patrón listo; fuerza k++ y assist
+  // Mantienen la firma pública; internamente seleccionan el sentido actual (_dir).
+  bool  startCalibration(uint8_t lapsN);
+  bool  startAlignment(uint8_t lapsN);
 
   // Estado de rutinas (expuestos para coordinación externa)
   bool  isCalibrating() const { return _cal.isCalibrating(); }
   bool  isAligning()   const { return _cal.isAligning(); }
 
-  // --- Utilidades LUT ---
-  void  setUseLUT(bool on) { _cal.setUseLUT(on); _cal.save(); }
-  bool  useLUT()      const { return _cal.useLUT(); }
-  bool  patternReady()const { return _cal.patternReady(); }
+  // --- Utilidades LUT (compat dual) ---
+  void  setUseLUT(bool on) {
+    _cal.setUseLUTFwd(on);
+    _cal.setUseLUTRev(on);
+    _cal.save();
+  }
+  bool  useLUT()      const { return _cal.useLUTFwd() || _cal.useLUTRev(); }
+  bool  patternReady()const { return _cal.patternFwdReady() || _cal.patternRevReady(); }
   void  clearLUT()          { _cal.clear(); }
   void  printLUT(Stream& s = Serial) const { _cal.printLUT(s); }
   void  printSectorStats(Stream& s = Serial) const { _cal.printSectorStats(s); }
@@ -83,9 +88,9 @@ public:
 
 private:
   void _applyDirectionLogic_();     // decide k++/k-- según u aplicado
-  void _assistBegin_(bool isCal);   // activa asistente (memoriza u y fuerza u=+assistU)
+  void _assistBegin_(bool isCal, int dir);   // activa asistente con el signo pedido
   void _assistTrackEnd_();          // detecta fin de cal/align y restaura u
-  void _maybeAutoAlignOnBoot_();    // inicia alineación en boot si procede
+  void _maybeAutoAlignOnBoot_();    // inicia alineación en boot si procede (en _dir)
 
 private:
   Config _cfg;
@@ -106,8 +111,9 @@ private:
   AssistMode _assistMode = AssistNone;
   float      _assistPrevU = 0.0f;
 
-  // Dirección (histeresis)
-  int8_t      _dir = +1;
+  // Dirección (histeresis) y dirección activa de rutina
+  int8_t      _dir = +1;             // sentido inferido por mando aplicado
+  int8_t      _routineDir = +1;      // sentido “fijado” durante cal/align
   uint32_t    _lastStrongCmdMs = 0;
 
   // Logging

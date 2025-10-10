@@ -1,99 +1,76 @@
-#ifndef PID_VEL_H
-#define PID_VEL_H
+#pragma once
+#include <cmath>
+#include <cfloat>
 
-#include <Arduino.h>
+#ifndef PID_LOGF
+  #define PID_LOGF(fmt, ...) ((void)0)
+#endif
 
-// ============================================================
-// PIDVel — PID incremental (forma de velocidad)
-// Implementa EXACTAMENTE:
-//
-//   u[n] = u[n-1]
-//        + (Kp + Kd/Ts)            * e[n]
-//        + (-Kp + Ki*Ts - 2*Kd/Ts) * e[n-1]
-//        + (Kd/Ts)                 * e[n-2]
-//
-// Pensado para entregar |u| (magnitud). Por defecto satura en [0, 1].
-// El signo del actuador lo maneja otra capa (p. ej. MotorPWM).
-// ============================================================
 class PIDVel {
 public:
   struct Config {
-    float Kp = 0.0f;
-    float Ki = 0.0f;
-    float Kd = 0.0f;
-    float Ts = 0.01f;        // periodo de muestreo [s]
-
-    // Límites de salida (magnitud):
-    float uMin = 0.0f;
-    float uMax = 1.0f;
-    bool  clampOutput = true;
+    float Kp   = 0.0f;
+    float Ki   = 0.0f;     // [1/s]
+    float Kd   = 0.0f;     // [s]·K(s) en paralelo clásico
+    float Tf   = 0.0f;     // filtro derivativo (s)  -> si usas N: Tf = Kd/N
+    float Ts   = 0.10f;    // periodo de muestreo [s]
+    float uMin = 0.0f;     // salida mínima (0..1)
+    float uMax = 1.0f;     // salida máxima (0..1)
   };
 
+  enum Discretization {
+    PI_Tustin = 0,
+    PIDF_Tustin
+  };
+
+  // === Constructores (corregido: sin argumento por defecto en .h) ===
   explicit PIDVel(const Config& cfg);
+  PIDVel(); // ctor por defecto delegado
 
-  // Actualiza con referencia y medición en magnitud (rad/s)
-  // Devuelve u[n] ∈ [uMin, uMax]
-  float update(float refMag, float measMag);
+  // === Setup / configuración dinámica ===
+  void setGains(float Kp, float Ki, float Kd);
+  void setTf(float Tf);
+  void setTs(float Ts);
+  void setDiscretization(Discretization m);
+  void setAntiWindup(bool on);
 
-  // Azucarado: referencia con signo + medición en magnitud
-  float updateMagnitude(float refSigned, float measMag) {
-    return update(fabsf(refSigned), measMag);
-  }
+  // === Operación ===
+  void  reset(float u0 = 0.0f);
+  float update(float r, float y);
 
-  // ---- Tunings / configuración en caliente ----
-  void  setTunings(float Kp, float Ki, float Kd);
-  void  setTs(float Ts);
-  void  setOutputLimits(float uMin, float uMax, bool clamp = true);
-
-  // ---- Estado ----
-  void  reset(float u0 = 0.0f);                 // u[n-1]=u0, e[n-1]=e[n-2]=0
-  void  setInitialErrors(float e1, float e2);   // fija e[n-1], e[n-2]
-  void  setInitialOutput(float u_prev);         // fija u[n-1]
-
-  // ---- Logging y debug ----
-  void  setLog(Stream* s) { _log = s; }         // activa logs
-  void  printDebugEvery(uint32_t periodMs = 200);
-  void  printTunings(Stream& s = Serial) const;
-  void  printCoeffs(Stream& s = Serial)  const;
-
-  // ---- Getters ----
-  float u()     const { return _u; }        // u[n]
-  float uPrev() const { return _uPrev; }    // u[n-1]
-  float e()     const { return _e; }        // e[n]
-  float e1()    const { return _e1; }       // e[n-1]
-  float e2()    const { return _e2; }       // e[n-2]
-  float Ts()    const { return _cfg.Ts; }
-  float ref()   const { return _refMag; }   // última ref usada (mag)
-  float meas()  const { return _measMag; }  // última medición usada (mag)
+  // === Getters ===
+  float u()    const { return _uSat; }
+  float getKp() const { return _cfg.Kp; }
+  float getKi() const { return _cfg.Ki; }
+  float getKd() const { return _cfg.Kd; }
+  float getTf() const { return _cfg.Tf; }
+  float getTs() const { return _cfg.Ts; }
 
 private:
-  void  _recomputeCoeffs();
-  static inline float _clamp(float x, float a, float b) {
-    return (x < a) ? a : (x > b) ? b : x;
-  }
-
-private:
+  // Config activa
   Config _cfg;
 
-  // Estados
-  float _e   = 0.0f;     // e[n]
-  float _e1  = 0.0f;     // e[n-1]
-  float _e2  = 0.0f;     // e[n-2]
-  float _u   = 0.0f;     // u[n]
-  float _uPrev = 0.0f;   // u[n-1]
+  // Modo de discretización
+  Discretization _mode = PI_Tustin;
 
-  // Últimos ref/medición (para logs)
-  float _refMag  = 0.0f;
-  float _measMag = 0.0f;
+  // Flags
+  bool _antiWindup = false;
 
-  // Coeficientes (c0, c1, c2)
-  float _c0 = 0.0f;
-  float _c1 = 0.0f;
-  float _c2 = 0.0f;
+  // Estados de error/medición
+  float _e=0, _e1=0, _e2=0;      // error(k), error(k-1), error(k-2)
+  float _y=0, _y1=0;             // salida medida
+  float _uPid=0;                  // salida "pura" del calculador (antes de sat.)
+  float _uSat=0;                  // salida saturada
 
-  // Logging
-  Stream*  _log        = nullptr;
-  uint32_t _dbgLastMs  = 0;
+  // Derivada filtrada (PIDF_Tustin): dY[k] = (1-alpha)*dY[k-1] + alpha*(y[k]-y[k-1])
+  float _dY=0, _dY1=0;
+  float _alpha=0;                // Ts/(Tf+Ts)
+
+  // Coeficientes incrementales (modo PI_Tustin)
+  float _c0=0, _c1=0, _c2=0;     // con PI_Tustin: c2=0
+
+  // Helpers
+  void  _recomputeInternals();
+  void  _computePI_TustinCoeffs();
+  float _clamp(float v, float a, float b) const { return (v<b)?((v>a)?v:a):b; }
 };
-
-#endif // PID_VEL_H
